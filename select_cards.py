@@ -1,20 +1,35 @@
 import pandas as pd
 import numpy as np
-import re, sys, csv, os
-import openai
+import re, sys, csv, os, argparse
 import tiktoken
-from openai.embeddings_utils import get_embedding, cosine_similarity
-from openai.error import RateLimitError, APIError, ServiceUnavailableError
-import time, requests
+import time
+
+try:
+    from openrouter import OpenRouter
+except ImportError:
+    OpenRouter = None
+
+def cosine_similarity(a, b):
+    """Calculate cosine similarity between two vectors."""
+    a = np.array(a)
+    b = np.array(b)
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
 MAX_POOR_MATCH_RUN = 10
 MAX_TOKENS_PER_OBJ = 5000
+MAX_TOKENS = 32000  # Increased for modern models
+TOKEN_BUFFER = 1000
 
-def set_api_key():
-    try:
-        openai.api_key = os.getenv('OPENAI_API_KEY')
-    except KeyError:
-        print("Set your OpenAI API key as an environment variable named 'OPENAI_API_KEY' eg In terminal: export OPENAI_API_KEY=your-api-key")
+def get_openrouter_api_key(api_key=None):
+    """Get OpenRouter API key from parameter or environment variable."""
+    if OpenRouter is None:
+        print("OpenRouter package is required. Install it with: pip install openrouter")
+        sys.exit(1)
+    api_key = api_key or os.getenv('OPENROUTER_API_KEY')
+    if not api_key:
+        print("Set your OpenRouter API key as an environment variable named 'OPENROUTER_API_KEY' eg In terminal: export OPENROUTER_API_KEY=your-api-key")
+        sys.exit(1)
+    return api_key
 
 def handle_api_error(func):
     def wrapper(*args, **kwargs):
@@ -22,10 +37,17 @@ def handle_api_error(func):
         while True:
             try:
                 return func(*args, **kwargs)
-            except (RateLimitError, APIError, ServiceUnavailableError):
-                print(f'API Error. Waiting {t}s before retrying.')
-                time.sleep(t)  # wait for 10 seconds before retrying
-                t+=5
+            except Exception as e:
+                # Handle various API errors (rate limits, connection errors, etc.)
+                error_str = str(e).lower()
+                if 'rate limit' in error_str or '429' in error_str or 'quota' in error_str:
+                    print(f'Rate limit exceeded. Waiting {t}s before retrying.')
+                elif 'connection' in error_str or 'timeout' in error_str:
+                    print(f'Connection error. Waiting {t}s before retrying.')
+                else:
+                    print(f'API Error: {e}. Waiting {t}s before retrying.')
+                time.sleep(t)
+                t += 5
     return wrapper
 
 def convert_to_np_array(s):
@@ -59,7 +81,8 @@ def construct_prompt(obj,card):
     return formatted_prompt
 
 def count_tokens(text):
-    enc = tiktoken.encoding_for_model("gpt-3.5-turbo")
+    # Use cl100k_base encoding as a general estimate (works reasonably well for most models)
+    enc = tiktoken.get_encoding("cl100k_base")
     tokens = list(enc.encode(text))
     return len(tokens)
 
@@ -70,21 +93,28 @@ def tokens_in_prompt(formatted_prompt):
     return count_tokens(formatted_prompt_str)
 
 @handle_api_error
-def rate_card_for_obj(prompt, temperature=1):
+def rate_card_for_obj(prompt, model="google/gemini-3-flash-preview", temperature=1, api_key=None):
 
     # Calculate the remaining tokens for the response
+    prompt_tokens = tokens_in_prompt(prompt)
+    remaining_tokens = MAX_TOKENS - prompt_tokens - TOKEN_BUFFER
 
-    remaining_tokens = 4096 - tokens_in_prompt(prompt) - 20
+    if remaining_tokens < TOKEN_BUFFER:
+        print(f"Warning! Input text is longer than the model can support. Consider trimming input.")
+        remaining_tokens = TOKEN_BUFFER
 
-    completions = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",  # Use the gpt-3.5-turbo engine
-        messages=prompt,
-        max_tokens=remaining_tokens,  # Set the remaining tokens as the maximum for the response
-        n=1,
-        stop=None,
-        temperature=temperature)
-
-    string_return = completions['choices'][0]['message']['content'].strip()
+    # OpenRouter client must be used as a context manager
+    api_key = get_openrouter_api_key(api_key=api_key)
+    with OpenRouter(api_key=api_key) as openrouter:
+        response = openrouter.chat.send(
+            model=model,
+            messages=prompt,
+            max_tokens=remaining_tokens,
+            temperature=temperature
+        )
+        # Access response inside context manager
+        string_return = response.choices[0].message.content.strip()
+    
     return string_return.replace('\n',' ')
 
 def clean_reply(s):
@@ -103,7 +133,7 @@ def clean_reply(s):
         else:
             return "NA"
 
-def main(emb_path,obj_path):
+def main(emb_path, obj_path, chat_model="google/gemini-3-flash-preview", api_key=None):
 
     output_prefix = os.path.basename(obj_path).replace("_learning_objectives.csv",'')
 
@@ -159,7 +189,7 @@ def main(emb_path,obj_path):
                 #try with progressively more creative juice
                 temp = 0
                 while score == "NA" and temp <= 1:
-                    gpt_reply = rate_card_for_obj(prompt, temperature=temp)
+                    gpt_reply = rate_card_for_obj(prompt, model=chat_model, temperature=temp, api_key=api_key)
                     score = clean_reply(gpt_reply)
                     temp += 0.25
 
@@ -174,10 +204,22 @@ def main(emb_path,obj_path):
                 progress_csv_writer.writerow([obj_index])
 
 if __name__ == "__main__":
-    set_api_key()
-    if len(sys.argv) != 3:
-        print("Usage: select_cards.py <deck_embeding> <learning_objectives>")
-        sys.exit(1)
-    emb_path = sys.argv[1]
-    obj_path = sys.argv[2]
-    main(emb_path,obj_path)
+    parser = argparse.ArgumentParser(description='Select Anki cards matching learning objectives')
+    parser.add_argument('emb_path', type=str,
+                        help='Path to deck embeddings CSV file')
+    parser.add_argument('obj_path', type=str,
+                        help='Path to learning objectives CSV file')
+    parser.add_argument('--chat-model', type=str, default='google/gemini-3-flash-preview',
+                        help='Chat model for rating cards (default: google/gemini-3-flash-preview)')
+    parser.add_argument('--api-key', type=str, default=None,
+                        help='API key for OpenRouter (or set OPENROUTER_API_KEY env var)')
+    
+    args = parser.parse_args()
+    
+    # Use provided API key or environment variable
+    api_key = args.api_key or os.getenv('OPENROUTER_API_KEY')
+    
+    # Validate OpenRouter API key is available (will exit if not found)
+    get_openrouter_api_key(api_key=api_key)
+    
+    main(args.emb_path, args.obj_path, chat_model=args.chat_model, api_key=api_key)
