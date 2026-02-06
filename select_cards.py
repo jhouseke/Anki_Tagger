@@ -1,8 +1,20 @@
 import pandas as pd
 import numpy as np
 import re, sys, csv, os, argparse
+from pathlib import Path
 import tiktoken
 import time
+from config_loader import (
+    load_config,
+    get_api_key,
+    PROJECT_ROOT,
+    EMBEDDINGS_CSV,
+    LEARNING_OBJECTIVES_CSV,
+    CARDS_CSV,
+    PROGRESS_CSV,
+    require_file,
+)
+from tqdm import tqdm
 
 try:
     from openrouter import OpenRouter
@@ -14,11 +26,6 @@ def cosine_similarity(a, b):
     a = np.array(a)
     b = np.array(b)
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
-
-MAX_POOR_MATCH_RUN = 10
-MAX_TOKENS_PER_OBJ = 5000
-MAX_TOKENS = 32000  # Increased for modern models
-TOKEN_BUFFER = 1000
 
 def get_openrouter_api_key(api_key=None):
     """Get OpenRouter API key from parameter or environment variable."""
@@ -55,14 +62,18 @@ def convert_to_np_array(s):
 
 def load_emb(path):
 
-    # Specify the data types for columns 0, 1, and 2
-    column_dtypes = {0: str, 1: str, 2: int}
-
-    # Read CSV file and interpret column types
+    # Be tolerant of duplicate header rows / bad values (e.g. 'tokens' as a value)
+    # and support both embeddings CSV (guid, card, tokens, emb) and objectives CSV
+    # (name, learning_objective, tokens, emb).
     df = pd.read_csv(
         path,
-        dtype=column_dtypes,
-        converters={3: convert_to_np_array})
+        dtype={"guid": str, "card": str, "name": str, "learning_objective": str},
+        converters={"emb": convert_to_np_array},
+    )
+
+    if "tokens" in df.columns:
+        df["tokens"] = pd.to_numeric(df["tokens"], errors="coerce")
+        df = df.dropna(subset=["tokens"]).astype({"tokens": int})
 
     return df
 
@@ -93,15 +104,14 @@ def tokens_in_prompt(formatted_prompt):
     return count_tokens(formatted_prompt_str)
 
 @handle_api_error
-def rate_card_for_obj(prompt, model="google/gemini-3-flash-preview", temperature=1, api_key=None):
+def rate_card_for_obj(prompt, model="google/gemini-3-flash-preview", temperature=1, api_key=None, max_tokens=32000, token_buffer=1000):
 
-    # Calculate the remaining tokens for the response
     prompt_tokens = tokens_in_prompt(prompt)
-    remaining_tokens = MAX_TOKENS - prompt_tokens - TOKEN_BUFFER
+    remaining_tokens = max_tokens - prompt_tokens - token_buffer
 
-    if remaining_tokens < TOKEN_BUFFER:
+    if remaining_tokens < token_buffer:
         print(f"Warning! Input text is longer than the model can support. Consider trimming input.")
-        remaining_tokens = TOKEN_BUFFER
+        remaining_tokens = token_buffer
 
     # OpenRouter client must be used as a context manager
     api_key = get_openrouter_api_key(api_key=api_key)
@@ -133,29 +143,55 @@ def clean_reply(s):
         else:
             return "NA"
 
-def main(emb_path, obj_path, chat_model="google/gemini-3-flash-preview", api_key=None):
+def _first_vector_len(series):
+    """Return length of first non-empty embedding vector in a Series, else None."""
+    for v in series:
+        if v is None:
+            continue
+        arr = np.array(v)
+        if arr.size:
+            return int(arr.size)
+    return None
 
-    output_prefix = os.path.basename(obj_path).replace("_learning_objectives.csv",'')
+
+def main(emb_path, obj_path, chat_model="google/gemini-3-flash-preview", api_key=None, max_tokens=32000, token_buffer=1000, max_poor_match_run=10, max_tokens_per_obj=5000):
+
+    emb_path = str(Path(emb_path).resolve())
+    obj_path = str(Path(obj_path).resolve())
+    cards_file = PROJECT_ROOT / CARDS_CSV
+    progress_file = PROJECT_ROOT / PROGRESS_CSV
+
+    if cards_file.exists():
+        print(f"Cards already selected: {cards_file} (skipping)")
+        return
 
     # load previous progress if exists
     last_processed_index = -1
-    progress_file = f"{output_prefix}_progress.csv"
-
-    if os.path.exists(progress_file):
+    if progress_file.exists():
         last_progress_df = pd.read_csv(progress_file)
         if not last_progress_df.empty:
-            last_processed_index = last_progress_df.iloc[-1][0]
+            last_processed_index = int(last_progress_df.iloc[-1][0])
 
     emb_df = load_emb(emb_path)
     obj_df = load_emb(obj_path)
 
-    with open(f'{output_prefix}_cards.csv', 'a', newline='', encoding='utf-8') as csvfile:
+    # Hard fail early if embedding dimensions don't match (common source of silent bad results)
+    deck_dim = _first_vector_len(emb_df.get("emb", []))
+    obj_dim = _first_vector_len(obj_df.get("emb", []))
+    if deck_dim and obj_dim and deck_dim != obj_dim:
+        raise ValueError(
+            f"Embedding dimension mismatch: deck embeddings are {deck_dim}D but objectives are {obj_dim}D.\n"
+            "Fix: ensure `embedding.provider` and `embedding.model` are the SAME when running\n"
+            "`embed_anki_deck.py` and `make_learning_objectives.py`, then regenerate both CSVs."
+        )
+
+    with open(cards_file, 'a', newline='', encoding='utf-8') as csvfile:
         csv_writer = csv.writer(csvfile)
 
         if last_processed_index == -1:  # if there's no previous progress
             csv_writer.writerow(['guid','card','tag','cosine_sim','gpt_reply','score','objective'])
 
-        for obj_index,obj_row in obj_df.iterrows():
+        for obj_index, obj_row in tqdm(list(obj_df.iterrows()), desc="Objectives", unit="obj", dynamic_ncols=True):
 
             if obj_index <= last_processed_index:
                 continue  # skip if the row has already been processed
@@ -166,15 +202,16 @@ def main(emb_path, obj_path, chat_model="google/gemini-3-flash-preview", api_key
             tokens = obj_row['tokens']
             obj_emb = obj_row['emb']
 
-            emb_df["cosine_sim"] = emb_df.emb.apply(lambda x: vs(obj_emb,x))
+            # Vectorized similarity would be faster, but keep simple + show progress.
+            emb_df["cosine_sim"] = emb_df.emb.apply(lambda x: vs(obj_emb, x))
             emb_df.sort_values(by='cosine_sim', ascending=False, inplace=True)
 
             poor_match_run_count = 0
             tokens_used = 0
 
-            for index,emb_row in emb_df.iterrows():
+            for index, emb_row in tqdm(list(emb_df.iterrows()), desc="Cards", unit="card", leave=False, dynamic_ncols=True):
 
-                if poor_match_run_count > MAX_POOR_MATCH_RUN or tokens_used > MAX_TOKENS_PER_OBJ:
+                if poor_match_run_count > max_poor_match_run or tokens_used > max_tokens_per_obj:
                     break
 
                 guid = emb_row['guid']
@@ -189,7 +226,7 @@ def main(emb_path, obj_path, chat_model="google/gemini-3-flash-preview", api_key
                 #try with progressively more creative juice
                 temp = 0
                 while score == "NA" and temp <= 1:
-                    gpt_reply = rate_card_for_obj(prompt, model=chat_model, temperature=temp, api_key=api_key)
+                    gpt_reply = rate_card_for_obj(prompt, model=chat_model, temperature=temp, api_key=api_key, max_tokens=max_tokens, token_buffer=token_buffer)
                     score = clean_reply(gpt_reply)
                     temp += 0.25
 
@@ -204,22 +241,37 @@ def main(emb_path, obj_path, chat_model="google/gemini-3-flash-preview", api_key
                 progress_csv_writer.writerow([obj_index])
 
 if __name__ == "__main__":
+    cfg = load_config()
+    chat = cfg.get("chat", {})
+    sc = cfg.get("select_cards", {})
+
     parser = argparse.ArgumentParser(description='Select Anki cards matching learning objectives')
-    parser.add_argument('emb_path', type=str,
-                        help='Path to deck embeddings CSV file')
-    parser.add_argument('obj_path', type=str,
-                        help='Path to learning objectives CSV file')
-    parser.add_argument('--chat-model', type=str, default='google/gemini-3-flash-preview',
-                        help='Chat model for rating cards (default: google/gemini-3-flash-preview)')
+    parser.add_argument('emb_path', type=str, nargs='?', default=None,
+                        help=f'Deck embeddings CSV (default: project root / {EMBEDDINGS_CSV})')
+    parser.add_argument('obj_path', type=str, nargs='?', default=None,
+                        help=f'Learning objectives CSV (default: project root / {LEARNING_OBJECTIVES_CSV})')
+    parser.add_argument('--chat-model', type=str, default=chat.get("model"),
+                        help='Chat model for rating (default from config)')
     parser.add_argument('--api-key', type=str, default=None,
-                        help='API key for OpenRouter (or set OPENROUTER_API_KEY env var)')
-    
+                        help='OpenRouter API key (or OPENROUTER_API_KEY env)')
     args = parser.parse_args()
-    
-    # Use provided API key or environment variable
-    api_key = args.api_key or os.getenv('OPENROUTER_API_KEY')
-    
-    # Validate OpenRouter API key is available (will exit if not found)
+
+    if args.emb_path and args.obj_path:
+        emb_path = args.emb_path
+        obj_path = args.obj_path
+    else:
+        emb_path = str(require_file(EMBEDDINGS_CSV, "select_cards (embeddings)"))
+        obj_path = str(require_file(LEARNING_OBJECTIVES_CSV, "select_cards (objectives)"))
+    api_key = args.api_key or get_api_key(cfg)
     get_openrouter_api_key(api_key=api_key)
-    
-    main(args.emb_path, args.obj_path, chat_model=args.chat_model, api_key=api_key)
+
+    main(
+        emb_path,
+        obj_path,
+        chat_model=args.chat_model,
+        api_key=api_key,
+        max_tokens=chat.get("max_tokens", 32000),
+        token_buffer=chat.get("token_buffer", 1000),
+        max_poor_match_run=sc.get("max_poor_match_run", 10),
+        max_tokens_per_obj=sc.get("max_tokens_per_obj", 5000),
+    )

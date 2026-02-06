@@ -1,0 +1,36 @@
+# Anki Tagger – shared config (edit this file instead of passing CLI args)
+# API key: set OPENROUTER_API_KEY in a .env file in this directory, or in your shell environment
+#
+# All project files use default names in the project root:
+#   anki.txt, anki_embeddings.csv, learning_objectives.csv, anki_cards.csv, deck.apkg
+
+# Embedding provider used by embed_anki_deck and make_learning_objectives
+# Must match for both so embedding dimensions align when running select_cards
+embedding:
+  provider: ollama   # openrouter | ollama
+  model: hf.co/nomic-ai/nomic-embed-text-v1.5-GGUF:latest 
+  ollama_url: http://192.168.1.54:11434
+  encoding: cl100k_base
+  max_tokens: 8000       # OpenRouter; reduce for context limits
+  max_tokens_ollama: 768
+
+# Chat/LLM model for generating objectives and rating cards (OpenRouter)
+chat:
+  model: google/gemini-3-flash-preview
+  max_tokens: 32000
+  token_buffer: 1000
+
+# select_cards tuning
+select_cards:
+  max_poor_match_run: 10
+  max_tokens_per_obj: 5000
+
+# Optional: PDF or directory for learning objectives (otherwise pass as CLI arg)
+objectives:
+  input_path: objectives/   # e.g. objectives/ or lecture.pdf
+
+# tag_deck relevance cutoffs (score 0–100)
+tag_deck:
+  high_relevance_cutoff: 70
+  medium_relevance_cutoff: 40
+  remove_relevance_cutoff: 10

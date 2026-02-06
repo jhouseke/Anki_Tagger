@@ -1,15 +1,14 @@
 import os, sys
+import argparse
 import shutil
 import zipfile
 import subprocess
 import pandas as pd
 from anki.collection import Collection
+from config_loader import load_config, PROJECT_ROOT, CARDS_CSV, DECK_APKG, require_file
+from tqdm import tqdm
 
-HIGH_RELEVANCE_CUTOFF = 70
-MEDIUM_RELEVANCE_CUTOFF = 40
-REMOVE_RELEVANCE_CUTOFF = 10
-
-def main(card_path, anki_apkg):
+def main(card_path, anki_apkg, high_relevance_cutoff=70, medium_relevance_cutoff=40, remove_relevance_cutoff=10):
 
     # Load the csv file into a DataFrame
     df = pd.read_csv(card_path)
@@ -128,13 +127,13 @@ def main(card_path, anki_apkg):
         print("This suggests the .apkg file may be from a different deck than the one used to create embeddings.")
 
     # Iterate through all cards and apply tags
-    for index, row in df.iterrows():
+    for index, row in tqdm(list(df.iterrows()), desc="Tagging notes", unit="note", dynamic_ncols=True):
 
         guid = str(row['guid']).strip()
         tag = row['tag']
         score = int(row['score'])
 
-        if score >= HIGH_RELEVANCE_CUTOFF:
+        if score >= high_relevance_cutoff:
             try:
                 result = col.db.all("SELECT id, tags FROM notes WHERE guid = ?", guid)
                 if result:
@@ -145,7 +144,7 @@ def main(card_path, anki_apkg):
             except Exception as e:
                 print(f"Error processing guid {guid}: {e}")
 
-        if score < HIGH_RELEVANCE_CUTOFF and score >= MEDIUM_RELEVANCE_CUTOFF:
+        if score < high_relevance_cutoff and score >= medium_relevance_cutoff:
             try:
                 result = col.db.all("SELECT id, tags FROM notes WHERE guid = ?", guid)
                 if result:
@@ -156,7 +155,7 @@ def main(card_path, anki_apkg):
             except Exception as e:
                 print(f"Error processing guid {guid}: {e}")
 
-        if score < MEDIUM_RELEVANCE_CUTOFF and score >= REMOVE_RELEVANCE_CUTOFF:
+        if score < medium_relevance_cutoff and score >= remove_relevance_cutoff:
             try:
                 result = col.db.all("SELECT id, tags FROM notes WHERE guid = ?", guid)
                 if result:
@@ -204,9 +203,26 @@ def main(card_path, anki_apkg):
     shutil.rmtree("temp_folder")
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print("Usage: tag_deck.py <cards.csv> <anki_deck.apkg>")
-        sys.exit(1)
-    card_path = sys.argv[1]
-    anki_apkg = sys.argv[2]
-    main(card_path, anki_apkg)
+    cfg = load_config()
+    tag_cfg = cfg.get("tag_deck", {})
+
+    parser = argparse.ArgumentParser(description='Apply tags from cards CSV to Anki .apkg deck')
+    parser.add_argument('card_path', type=str, nargs='?', default=None,
+                        help=f'Cards CSV (default: project root / {CARDS_CSV})')
+    parser.add_argument('anki_apkg', type=str, nargs='?', default=None,
+                        help=f'Anki .apkg file (default: project root / {DECK_APKG})')
+    args = parser.parse_args()
+
+    if args.card_path and args.anki_apkg:
+        card_path = args.card_path
+        anki_apkg = args.anki_apkg
+    else:
+        card_path = str(require_file(CARDS_CSV, "tag_deck (cards)"))
+        anki_apkg = str(require_file(DECK_APKG, "tag_deck (.apkg)"))
+    main(
+        card_path,
+        anki_apkg,
+        high_relevance_cutoff=tag_cfg.get("high_relevance_cutoff", 70),
+        medium_relevance_cutoff=tag_cfg.get("medium_relevance_cutoff", 40),
+        remove_relevance_cutoff=tag_cfg.get("remove_relevance_cutoff", 10),
+    )

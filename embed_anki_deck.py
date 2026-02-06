@@ -1,20 +1,21 @@
 import os
 import argparse
+from pathlib import Path
 
 import pandas as pd
 import tiktoken
 from embedding_client import EmbeddingClient, EmbeddingProvider, get_embedding
 from tqdm import tqdm
-
-# Embedding Configuration
-EMBEDDING_MODEL = "text-embedding-ada-002"  # Default model (OpenRouter)
-EMBEDDING_ENCODING = "cl100k_base"
-MAX_TOKENS = 8000  # For OpenRouter (OpenAI models)
-MAX_TOKENS_OLLAMA = 512  # For Ollama models (conservative default, many have 512 token limit)
+from config_loader import (
+    load_config,
+    get_api_key,
+    PROJECT_ROOT,
+    DECK_EXPORT,
+    EMBEDDINGS_CSV,
+    require_file,
+)
 
 def load_dataset(input_datapath):
-    assert os.path.exists(input_datapath), f"{input_datapath} does not exist. Please check your file path."
-
     df = pd.read_csv(input_datapath, sep='\t', header=None, usecols=[0,1], names=["guid", "card"], comment='#').dropna()
     return df
 
@@ -25,47 +26,56 @@ def filter_by_tokens(df, encoding, max_tokens):
 def calculate_embeddings(df, embedding_client):
     return [embedding_client.get_embedding(card) for card in tqdm(df.card, desc="Calculating embeddings", dynamic_ncols=True)]
 
-def save_embeddings(df, output_prefix):
-    df.to_csv(f"./{output_prefix}_embeddings.csv", index=False)
+def save_embeddings(df, output_path):
+    df.to_csv(output_path, index=False)
 
 def main():
+    cfg = load_config()
+    emb = cfg["embedding"]
+
     parser = argparse.ArgumentParser(description='Generate embeddings for Anki deck')
-    parser.add_argument('--provider', type=str, default='openrouter',
+    parser.add_argument('--provider', type=str, default=emb.get("provider", "openrouter"),
                         choices=['openrouter', 'ollama'],
-                        help='Embedding provider: openrouter or ollama (default: openrouter)')
-    parser.add_argument('--model', type=str, default=EMBEDDING_MODEL,
-                        help=f'Model name (default: {EMBEDDING_MODEL})')
-    parser.add_argument('--input', type=str, default='./anki.txt',
-                        help='Input file path (default: ./anki.txt)')
-    parser.add_argument('--output', type=str, default='anki',
-                        help='Output file prefix (default: anki)')
+                        help='Embedding provider (default from config)')
+    parser.add_argument('--model', type=str, default=emb.get("model"),
+                        help='Embedding model (default from config)')
+    parser.add_argument('--input', type=str, default=None,
+                        help=f'Deck export path (default: project root / {DECK_EXPORT})')
     parser.add_argument('--api-key', type=str, default=None,
-                        help='API key for OpenRouter (or set OPENROUTER_API_KEY env var)')
-    parser.add_argument('--ollama-url', type=str, default=None,
-                        help='Ollama base URL (default: http://localhost:11434)')
-    
+                        help='OpenRouter API key (or OPENROUTER_API_KEY env)')
+    parser.add_argument('--ollama-url', type=str, default=emb.get("ollama_url"),
+                        help='Ollama base URL (default from config)')
     args = parser.parse_args()
-    
-    # Set deck to embed.
-    # This is the deck you'll apply your tags to in the end.
-    # In anki, export deck notes as plain text with GUID flag checked
-    input_datapath = args.input
-    output_prefix = args.output
 
-    # Determine max_tokens based on provider
-    if args.provider == 'ollama':
-        max_tokens_for_filter = MAX_TOKENS_OLLAMA
-        max_tokens_for_client = MAX_TOKENS_OLLAMA
+    if args.input:
+        input_path = Path(args.input)
+        if not input_path.exists():
+            raise FileNotFoundError(f"Input deck export not found: {input_path}")
+        input_datapath = str(input_path)
     else:
-        max_tokens_for_filter = MAX_TOKENS
-        max_tokens_for_client = None  # Let OpenRouter handle its own limits
+        input_datapath = str(require_file(DECK_EXPORT, "embed_anki_deck (input)"))
+    output_path = PROJECT_ROOT / EMBEDDINGS_CSV
+    if output_path.exists():
+        print(f"Embeddings already exist: {output_path} (skipping)")
+        return
 
-    # Initialize embedding client
+    provider = args.provider
+    model = args.model
+    api_key = args.api_key or get_api_key(cfg)
+
+    if provider == 'ollama':
+        max_tokens_for_filter = emb.get("max_tokens_ollama", 512)
+        max_tokens_for_client = max_tokens_for_filter
+    else:
+        max_tokens_for_filter = emb.get("max_tokens", 8000)
+        max_tokens_for_client = None
+    encoding_name = emb.get("encoding", "cl100k_base")
+
     try:
         embedding_client = EmbeddingClient(
-            provider=args.provider,
-            model=args.model,
-            api_key=args.api_key,
+            provider=provider,
+            model=model,
+            api_key=api_key,
             base_url=args.ollama_url,
             max_tokens=max_tokens_for_client
         )
@@ -73,16 +83,15 @@ def main():
         print(f"Error initializing embedding client: {e}")
         return
 
-    # Load and preprocess dataset
     df = load_dataset(input_datapath)
-    encoding = tiktoken.get_encoding(EMBEDDING_ENCODING)
+    encoding = tiktoken.get_encoding(encoding_name)
     df = filter_by_tokens(df, encoding, max_tokens_for_filter)
 
     # Calculate embeddings for cards
     df["emb"] = calculate_embeddings(df, embedding_client)
 
-    # Save embeddings to file
-    save_embeddings(df, output_prefix)
+    # Save embeddings to file in project root
+    save_embeddings(df, output_path)
 
 if __name__ == "__main__":
     main()

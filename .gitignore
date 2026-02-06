@@ -1,5 +1,8 @@
-# Exclude CSV files
+# Exclude project data files
 *.csv
+*.pdf
+*.apkg
+*.txt
 
 # Python
 __pycache__/

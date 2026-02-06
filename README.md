@@ -25,39 +25,39 @@ Alternatively, if you prefer using pip:
 pip install -e .
 ```
 
+## Configuration
+
+All scripts read shared settings from **`config.yaml`** in the project root. Edit this file instead of passing options on the command line. You can still override any option with CLI arguments when you run a script.
+
+- **Embedding**: provider, model, Ollama URL, token limits (used by `embed_anki_deck.py` and `make_learning_objectives.py`; keep the same so embedding dimensions match).
+- **Chat**: model and token limits for generating objectives and rating cards.
+- **Paths**: default paths for deck input/output, embeddings CSV, objectives CSV, cards CSV, and .apkg file. Set these in `config.yaml` to run scripts without arguments.
+- **select_cards**: `max_poor_match_run`, `max_tokens_per_obj`.
+- **tag_deck**: relevance score cutoffs (high / medium / minimal).
+
+Override config file location with the `CONFIG_PATH` environment variable.
+
 ## Embedding Provider Configuration
 
-This project supports multiple embedding providers:
-
-### OpenRouter (Default)
-- Set your OpenRouter API key: `export OPENROUTER_API_KEY=your-api-key`
-- Supports various embedding models (e.g., `text-embedding-ada-002`, `Taurus`)
-- Usage: `--provider openrouter --model text-embedding-ada-002`
-
-### Ollama (Local)
-- Requires Ollama to be installed and running locally
-- Supports local embedding models (e.g., `nomic-embed-text`)
-- Usage: `--provider ollama --model nomic-embed-text`
-- Optional: Set custom Ollama URL with `--ollama-url http://localhost:11434`
+- **OpenRouter (default)**: Set `export OPENROUTER_API_KEY=your-api-key`. Configure `embedding.provider` and `embedding.model` in `config.yaml`.
+- **Ollama (local)**: Install and run Ollama; set `embedding.provider: ollama` and `embedding.model` (e.g. `nomic-embed-text`) in `config.yaml`. Optional: `embedding.ollama_url`.
 
 # Workflow
-1. Set up your embedding provider (see above)
-2. In anki, export the deck you wish to tag as an anki_deck.apkg.
-3. In anki, export the deck using the Notes as plain text function, and select to include a unique identifier: anki.txt
-4. `python embed_anki_deck.py --input anki.txt --output anki`
-   - Options: `--provider [openrouter|ollama] --model <model-name> --api-key <key> --ollama-url <url>`
-   - Returns: anki_embeddings.csv
-   - This will create the embeddings of your deck: These are required for a first pass crude search of your deck to minimize API costs.
-5. `python make_learning_objectives.py <learning_guide.pdf> or <folder_of_pdfs>`
-   - Options: `--provider [openrouter|ollama] --model <model-name> --api-key <key> --ollama-url <url>`
-   - Returns: anki_learning_objectives.csv
-   - Create a list of summary learning objectives, the filename of the pdf will be the tag for the learning objective. Generally one lecture guide results in 10-30 questions.
-6. `python select_cards.py <deck_embedding> <learning_objectives>` 
-   - Returns: anki_cards.csv
-   - This will create a list of cards from your deck scoring them on their relevance to each learning objective.
-7. `python tag_deck.py <anki_cards.csv> <anki_deck.apkg>`
-   - Will tag the deck, and return the original deck apkg file.
-8. Import into Anki and enjoy!
+1. Copy or edit `config.yaml` and set paths/models as needed. Set `OPENROUTER_API_KEY` if using OpenRouter.
+2. In Anki, export the deck as an .apkg and as Notes (plain text) with GUID: e.g. `anki.txt`.
+3. **Embed deck**: `python embed_anki_deck.py`  
+   - Uses `paths.deck_input` and `paths.deck_output_prefix` from config (or `--input` / `--output`).  
+   - Produces `{output_prefix}_embeddings.csv`.
+4. **Learning objectives**: `python make_learning_objectives.py [path_to_pdf_or_folder]`  
+   - Path can be set as `objectives.input_path` in config or passed as the argument.  
+   - Produces `{stem}_learning_objectives.csv`.
+5. **Select cards**: `python select_cards.py [embeddings.csv] [objectives.csv]`  
+   - Paths from config if set, or pass as arguments.  
+   - Produces `{prefix}_cards.csv`.
+6. **Tag deck**: `python tag_deck.py [cards.csv] [deck.apkg]`  
+   - Paths from config if set, or pass as arguments.  
+   - Overwrites the .apkg with tagged deck.
+7. Import the updated .apkg into Anki.
 
 zachalmers
 
